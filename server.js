@@ -1,273 +1,524 @@
 import express from "express";
+import { chromium } from "playwright";
 import sharp from "sharp";
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use(express.static("public"));
 
-const jobs = new Map();
+const PORT = process.env.PORT || 10000;
 
-function makeId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2);
-}
-
-function validHttpUrl(value) {
-  const u = new URL(value);
-
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    throw new Error("只允许 http 或 https 地址");
-  }
-
-  return u;
-}
-
-async function readResponse(response) {
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `服务器返回 HTTP ${response.status}\n${text.slice(0, 300)}`
-    );
-  }
-
-  return text;
-}
-
-/*
- * 读取 IIIF info.json
- */
-async function getIIIFInfo(input) {
-  const u = validHttpUrl(input);
-
-  let infoUrl = u.toString();
-
-  if (!infoUrl.endsWith("/info.json")) {
-    infoUrl = infoUrl.replace(/\/+$/, "") + "/info.json";
-  }
-
-  const response = await fetch(infoUrl, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "Mozilla/5.0"
-    }
-  });
-
-  const text = await readResponse(response);
-
-  let info;
-
+function isHttpUrl(s) {
   try {
-    info = JSON.parse(text);
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
   } catch {
-    throw new Error(
-      "这个地址返回的不是 IIIF info.json。\n\n" +
-      "返回内容开头：\n" +
-      text.slice(0, 300)
-    );
+    return false;
+  }
+}
+
+function looksLikeDeepZoom(obj) {
+  if (!obj || typeof obj !== "object") return false;
+
+  const keys = Object.keys(obj).map(k => k.toLowerCase());
+
+  const hasUrl =
+    keys.includes("url") ||
+    keys.includes("tileurl") ||
+    keys.includes("tilesurl");
+
+  const hasSize =
+    keys.includes("size") ||
+    (keys.includes("width") && keys.includes("height"));
+
+  const hasTile =
+    keys.includes("tilesize") ||
+    keys.includes("tile_size");
+
+  return hasUrl && hasSize && hasTile;
+}
+
+function findDeepZoomObjects(root) {
+  const results = [];
+  const seen = new WeakSet();
+
+  function walk(value, path, depth) {
+    if (!value || typeof value !== "object") return;
+    if (depth > 8) return;
+    if (seen.has(value)) return;
+
+    seen.add(value);
+
+    try {
+      if (looksLikeDeepZoom(value)) {
+        results.push({
+          path,
+          value
+        });
+      }
+    } catch {}
+
+    let keys = [];
+    try {
+      keys = Object.keys(value);
+    } catch {
+      return;
+    }
+
+    for (const key of keys.slice(0, 300)) {
+      let child;
+
+      try {
+        child = value[key];
+      } catch {
+        continue;
+      }
+
+      if (
+        child &&
+        typeof child === "object" &&
+        !Array.isArray(child)
+      ) {
+        walk(child, `${path}.${key}`, depth + 1);
+      }
+    }
   }
 
-  if (!info.width || !info.height) {
-    throw new Error("没有找到图像 Width / Height");
+  walk(root, "window", 0);
+  return results;
+}
+
+function normalizeSource(x) {
+  if (!x || typeof x !== "object") return null;
+
+  let url =
+    x.Url ??
+    x.url ??
+    x.TileUrl ??
+    x.tileUrl ??
+    x.TilesUrl ??
+    x.tilesUrl;
+
+  let width;
+  let height;
+
+  const size = x.Size ?? x.size;
+
+  if (size && typeof size === "object") {
+    width = Number(size.Width ?? size.width);
+    height = Number(size.Height ?? size.height);
   }
+
+  if (!width) width = Number(x.Width ?? x.width);
+  if (!height) height = Number(x.Height ?? x.height);
+
+  const tileSize = Number(
+    x.TileSize ??
+    x.tileSize ??
+    x.tile_size
+  );
+
+  const overlap = Number(
+    x.Overlap ??
+    x.overlap ??
+    0
+  );
+
+  const format =
+    x.Format ??
+    x.format ??
+    "jpg";
+
+  if (!url || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+
+  if (!isHttpUrl(url)) return null;
 
   return {
-    info,
-    infoUrl
+    url,
+    width,
+    height,
+    tileSize: Number.isFinite(tileSize) && tileSize > 0 ? tileSize : 256,
+    overlap: Number.isFinite(overlap) ? overlap : 0,
+    format
   };
 }
 
-/*
- * 从 IIIF info.json 得到图像服务根地址
- */
-function getBaseUrl(infoUrl) {
-  return infoUrl.replace(/\/info\.json.*$/, "");
+function deepZoomLevel(width, height) {
+  return Math.ceil(Math.log2(Math.max(width, height)));
 }
 
-/*
- * 生成 IIIF full 图片地址
- */
-function fullImageUrl(baseUrl) {
-  return `${baseUrl}/full/max/0/default.jpg`;
+function tileCount(size, tileSize) {
+  return Math.ceil(size / tileSize);
 }
 
-/*
- * 尝试获取完整图片
- */
-async function tryFullImage(baseUrl) {
-  const url = fullImageUrl(baseUrl);
+function makeTileUrl(base, level, x, y, format) {
+  let root = base;
 
-  const response = await fetch(url, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Accept": "image/jpeg,image/png,image/*"
-    }
-  });
+  if (!root.endsWith("/")) root += "/";
 
-  if (!response.ok) {
-    throw new Error(`完整图 HTTP ${response.status}`);
-  }
-
-  const type = response.headers.get("content-type") || "";
-
-  if (!type.startsWith("image/")) {
-    throw new Error("服务器没有返回图片");
-  }
-
-  return Buffer.from(await response.arrayBuffer());
+  return `${root}${level}/${x}_${y}.${format}`;
 }
 
-async function generate(job, input) {
-  job.status = "正在读取图像信息";
-  job.progress = 5;
+async function downloadTile(context, url) {
+  const response = await context.request.get(url);
 
-  const { info, infoUrl } = await getIIIFInfo(input);
-
-  job.width = info.width;
-  job.height = info.height;
-
-  /*
-   * 先尝试 IIIF 原图接口。
-   */
-  try {
-    job.status = "正在获取完整图像";
-    job.progress = 20;
-
-    const image = await tryFullImage(getBaseUrl(infoUrl));
-
-    const metadata = await sharp(image).metadata();
-
-    if (!metadata.width || !metadata.height) {
-      throw new Error("返回内容不是有效图像");
-    }
-
-    job.buffer = image;
-    job.progress = 100;
-    job.status = "完成";
-
-    return;
-  } catch {
-    /*
-     * 这里不再假装 IIIF 一定可以拼。
-     * 如果没有直接原图，告诉用户实际原因。
-     */
+  if (!response.ok()) {
+    throw new Error(`Tile HTTP ${response.status()}`);
   }
 
-  if (!info.tiles || !info.tiles.length) {
+  return await response.body();
+}
+
+async function assembleDeepZoom(source, context) {
+  const {
+    url,
+    width,
+    height,
+    tileSize,
+    format
+  } = source;
+
+  const level = deepZoomLevel(width, height);
+
+  const scale = Math.pow(
+    2,
+    level - Math.ceil(Math.log2(Math.max(width, height)))
+  );
+
+  const levelWidth = Math.ceil(width * scale);
+  const levelHeight = Math.ceil(height * scale);
+
+  const cols = tileCount(levelWidth, tileSize);
+  const rows = tileCount(levelHeight, tileSize);
+
+  if (cols * rows > 10000) {
     throw new Error(
-      "这个 IIIF 服务没有提供可识别的瓦片信息，也无法直接获取完整图像。"
+      `最高层需要 ${cols * rows} 张瓦片，数量过大，已停止。`
     );
   }
 
-  throw new Error(
-    "检测到了 IIIF 图像服务，但当前服务不允许直接取得完整原图。"
-  );
+  const tiles = [];
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const tileUrl = makeTileUrl(
+        url,
+        level,
+        x,
+        y,
+        format
+      );
+
+      tiles.push({
+        x,
+        y,
+        url: tileUrl
+      });
+    }
+  }
+
+  const canvas = sharp({
+    create: {
+      width: levelWidth,
+      height: levelHeight,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 }
+    }
+  });
+
+  const composites = [];
+
+  for (const tile of tiles) {
+    const buffer = await downloadTile(
+      context,
+      tile.url
+    );
+
+    const metadata = await sharp(buffer).metadata();
+
+    composites.push({
+      input: buffer,
+      left: tile.x * tileSize,
+      top: tile.y * tileSize,
+      blend: "over"
+    });
+
+    if (!metadata.width || !metadata.height) {
+      throw new Error("无法读取瓦片尺寸");
+    }
+  }
+
+  return await canvas
+    .composite(composites)
+    .jpeg({
+      quality: 95,
+      chromaSubsampling: "4:4:4"
+    })
+    .toBuffer();
 }
 
-/*
- * 创建任务
- */
-app.post("/api/start", async (req, res) => {
-  try {
-    const input = String(req.body?.url || "").trim();
+app.post("/api/analyze", async (req, res) => {
+  const input = String(req.body?.url || "").trim();
 
-    if (!input) {
-      return res.status(400).json({
+  if (!isHttpUrl(input)) {
+    return res.status(400).json({
+      error: "请输入完整的网址。"
+    });
+  }
+
+  let browser;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    });
+
+    const context = await browser.newContext({
+      viewport: {
+        width: 1440,
+        height: 1000
+      },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+    });
+
+    const page = await context.newPage();
+
+    const networkUrls = [];
+
+    page.on("request", request => {
+      const u = request.url();
+
+      if (
+        u.includes("image-bundle") ||
+        u.includes(".dzi") ||
+        u.includes("zoom") ||
+        u.includes("_")
+      ) {
+        networkUrls.push(u);
+      }
+    });
+
+    await page.goto(input, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    await page.waitForTimeout(8000);
+
+    const candidates = await page.evaluate(() => {
+      function isCandidate(x) {
+        if (!x || typeof x !== "object") return false;
+
+        const keys = Object.keys(x).map(k =>
+          k.toLowerCase()
+        );
+
+        return (
+          keys.includes("url") &&
+          (
+            keys.includes("tilesize") ||
+            keys.includes("size")
+          )
+        );
+      }
+
+      const found = [];
+      const seen = new WeakSet();
+
+      function walk(value, path, depth) {
+        if (!value || typeof value !== "object") return;
+        if (depth > 7) return;
+
+        if (seen.has(value)) return;
+        seen.add(value);
+
+        try {
+          if (isCandidate(value)) {
+            const copy = {};
+
+            for (const key of Object.keys(value)) {
+              const v = value[key];
+
+              if (
+                typeof v === "string" ||
+                typeof v === "number" ||
+                typeof v === "boolean"
+              ) {
+                copy[key] = v;
+              } else if (
+                v &&
+                typeof v === "object" &&
+                !Array.isArray(v)
+              ) {
+                const sub = {};
+
+                for (const k of Object.keys(v)) {
+                  const sv = v[k];
+
+                  if (
+                    typeof sv === "string" ||
+                    typeof sv === "number"
+                  ) {
+                    sub[k] = sv;
+                  }
+                }
+
+                copy[key] = sub;
+              }
+            }
+
+            found.push({
+              path,
+              value: copy
+            });
+          }
+        } catch {}
+
+        let keys;
+
+        try {
+          keys = Object.keys(value);
+        } catch {
+          return;
+        }
+
+        for (const key of keys.slice(0, 500)) {
+          let child;
+
+          try {
+            child = value[key];
+          } catch {
+            continue;
+          }
+
+          if (
+            child &&
+            typeof child === "object"
+          ) {
+            walk(
+              child,
+              `${path}.${key}`,
+              depth + 1
+            );
+          }
+        }
+      }
+
+      walk(window, "window", 0);
+
+      return found;
+    });
+
+    const normalized = [];
+
+    for (const item of candidates) {
+      const source = normalizeSource(item.value);
+
+      if (source) {
+        normalized.push({
+          path: item.path,
+          source
+        });
+      }
+    }
+
+    if (!normalized.length) {
+      return res.json({
         ok: false,
-        error: "请输入地址"
+        message:
+          "页面已经打开，但没有找到可识别的 Deep Zoom 参数。",
+        network: networkUrls.slice(0, 100)
       });
     }
 
-    validHttpUrl(input);
+    normalized.sort(
+      (a, b) =>
+        b.source.width * b.source.height -
+        a.source.width * a.source.height
+    );
 
-    const id = makeId();
+    const best = normalized[0];
 
-    const job = {
-      id,
-      status: "等待开始",
-      progress: 0,
-      width: 0,
-      height: 0,
-      buffer: null,
-      error: null
-    };
-
-    jobs.set(id, job);
-
-    res.json({
+    return res.json({
       ok: true,
-      id
+      source: best.source,
+      path: best.path,
+      candidates: normalized.slice(0, 10),
+      network: networkUrls.slice(0, 100)
     });
 
-    generate(job, input).catch(error => {
-      job.status = "失败";
-      job.error = error.message || String(error);
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message || String(err)
     });
-
-  } catch (error) {
-    res.status(400).json({
-      ok: false,
-      error: error.message || String(error)
-    });
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 });
 
-/*
- * 查询任务
- */
-app.get("/api/status/:id", (req, res) => {
-  const job = jobs.get(req.params.id);
+app.post("/api/download", async (req, res) => {
+  const source = req.body?.source;
 
-  if (!job) {
-    return res.status(404).json({
-      ok: false,
-      error: "任务不存在"
+  if (!source || !source.url) {
+    return res.status(400).json({
+      error: "没有可下载的图像源。"
     });
   }
 
-  res.json({
-    ok: true,
-    status: job.status,
-    progress: job.progress,
-    width: job.width,
-    height: job.height,
-    error: job.error,
-    ready: !!job.buffer
-  });
+  let browser;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    });
+
+    const context = await browser.newContext();
+
+    const buffer = await assembleDeepZoom(
+      source,
+      context
+    );
+
+    res.setHeader(
+      "Content-Type",
+      "image/jpeg"
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="dpm-full.jpg"'
+    );
+
+    res.send(buffer);
+
+  } catch (err) {
+    res.status(500).json({
+      error: err.message || String(err)
+    });
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
+  }
 });
 
-/*
- * 下载结果
- */
-app.get("/api/download/:id", (req, res) => {
-  const job = jobs.get(req.params.id);
-
-  if (!job || !job.buffer) {
-    return res.status(404).send("文件还没有生成");
-  }
-
-  res.setHeader("Content-Type", "image/jpeg");
-  res.setHeader(
-    "Content-Disposition",
-    'attachment; filename="full-resolution.jpg"'
+app.listen(PORT, () => {
+  console.log(
+    `Server running on port ${PORT}`
   );
-
-  res.send(job.buffer);
-});
-
-/*
- * 防止未知 API 被 Express 返回 HTML，
- * 统一返回 JSON。
- */
-app.use("/api", (req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "API 地址不存在"
-  });
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
 });
