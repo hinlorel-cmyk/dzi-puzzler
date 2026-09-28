@@ -1,6 +1,6 @@
 {
-  "name": "dzi-deepzoom-puzzler",
-  "version": "1.0.0",
+  "name": "dpm-image-downloader",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
+    "playwright": "^1.55.0",
     "sharp": "^0.34.3"
   }
 }
