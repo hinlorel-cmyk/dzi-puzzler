@@ -1,589 +1,333 @@
 import express from "express";
 import sharp from "sharp";
-import crypto from "crypto";
-import fs from "fs";
-import path from "path";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JOB_DIR = path.resolve("./jobs");
-
-fs.mkdirSync(JOB_DIR, { recursive: true });
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static("public"));
 
 const jobs = new Map();
 
-function makeId() {
-  return crypto.randomBytes(12).toString("hex");
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function updateJob(id, data) {
-  jobs.set(id, {
-    ...(jobs.get(id) || {}),
-    ...data
-  });
-}
-
-async function getBuffer(url) {
-  const response = await fetch(url, {
-    redirect: "follow"
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${url}`);
+function cleanUrl(value) {
+  try {
+    const u = new URL(value);
+    if (!["http:", "https:"].includes(u.protocol)) {
+      throw new Error("只支持 http/https 地址");
+    }
+    return u.toString();
+  } catch {
+    throw new Error("网址格式不正确");
   }
-
-  return Buffer.from(
-    await response.arrayBuffer()
-  );
 }
 
-async function getText(url) {
-  const response = await fetch(url, {
-    redirect: "follow"
+async function fetchJson(url) {
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "application/json,text/plain,*/*"
+    }
   });
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${url}`);
+  if (!r.ok) {
+    throw new Error(`读取失败 HTTP ${r.status}`);
   }
 
-  return await response.text();
+  return await r.json();
 }
 
-function parseDzi(xml) {
-  const imageTag =
-    xml.match(/<Image\b[^>]*>/i)?.[0] || "";
+/*
+  支持：
+  1. 直接输入 IIIF info.json
+  2. 输入 IIIF 图片服务基础地址
+*/
+async function getInfo(input) {
+  let url = cleanUrl(input);
 
-  const sizeTag =
-    xml.match(/<Size\b[^>]*>/i)?.[0] || "";
-
-  function attr(tag, name) {
-    const re = new RegExp(
-      `\\b${name}\\s*=\\s*["']([^"']+)["']`,
-      "i"
-    );
-
-    return tag.match(re)?.[1];
+  if (!url.endsWith("/info.json")) {
+    url = url.replace(/\/+$/, "") + "/info.json";
   }
 
-  const width =
-    Number(attr(sizeTag, "Width"));
+  const info = await fetchJson(url);
 
-  const height =
-    Number(attr(sizeTag, "Height"));
+  if (!info.width || !info.height) {
+    throw new Error("这个地址不是有效的 IIIF info.json");
+  }
 
-  const tileSize =
-    Number(attr(imageTag, "TileSize")) || 256;
+  return {
+    info,
+    infoUrl: url,
+    baseUrl: url.slice(0, -"/info.json".length)
+  };
+}
 
-  const overlap =
-    Number(attr(imageTag, "Overlap")) || 0;
+function chooseTileLevel(info) {
+  if (!Array.isArray(info.tiles) || !info.tiles.length) {
+    return null;
+  }
 
-  const format =
-    attr(imageTag, "Format") || "jpg";
+  const tile = info.tiles[0];
 
-  if (
-    !Number.isFinite(width) ||
-    !Number.isFinite(height)
-  ) {
+  if (!Array.isArray(tile.scaleFactors) || !tile.scaleFactors.length) {
+    return null;
+  }
+
+  // scaleFactor 越小，分辨率越高。
+  return {
+    width: tile.width,
+    height: tile.height || tile.width,
+    scaleFactor: Math.min(...tile.scaleFactors)
+  };
+}
+
+function iiifTileUrl(base, x, y, w, h, scale) {
+  const rx = x * scale;
+  const ry = y * scale;
+
+  const rw = Math.min(w * scale, 1000000000);
+  const rh = Math.min(h * scale, 1000000000);
+
+  return `${base}/${rx},${ry},${rw},${rh}/${w},${h}/0/default.jpg`;
+}
+
+async function downloadBuffer(url) {
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "image/avif,image/webp,image/jpeg,image/png,*/*"
+    }
+  });
+
+  if (!r.ok) {
+    throw new Error(`图片读取失败 HTTP ${r.status}`);
+  }
+
+  return Buffer.from(await r.arrayBuffer());
+}
+
+async function makeImage(input, job) {
+  const { info, baseUrl } = await getInfo(input);
+
+  job.status = "读取图像信息";
+  job.width = info.width;
+  job.height = info.height;
+
+  const tileInfo = chooseTileLevel(info);
+
+  /*
+    如果服务器允许直接请求 full，
+    优先尝试完整图。
+  */
+  const fullUrl =
+    `${baseUrl}/full/full/0/default.jpg`;
+
+  try {
+    job.status = "尝试获取完整原图";
+    const full = await downloadBuffer(fullUrl);
+
+    const meta = await sharp(full).metadata();
+
+    if (meta.width && meta.height) {
+      job.status = "完成";
+      job.progress = 100;
+
+      return full;
+    }
+  } catch {
+    // 完整图不可直接获取，继续走瓦片方式
+  }
+
+  if (!tileInfo) {
     throw new Error(
-      "无法从 DZI 找到 Width / Height"
+      "服务器没有提供可识别的 IIIF 瓦片信息，也无法直接取得完整图。"
     );
   }
 
-  return {
-    width,
-    height,
-    tileSize,
-    overlap,
-    format
-  };
+  const tw = tileInfo.width;
+  const th = tileInfo.height;
+  const scale = tileInfo.scaleFactor;
+
+  const cols = Math.ceil(info.width / (tw * scale));
+  const rows = Math.ceil(info.height / (th * scale));
+
+  job.status = `开始拼接 ${cols} × ${rows} 个最高级瓦片`;
+  job.total = cols * rows;
+  job.done = 0;
+
+  /*
+    为了避免手机/服务器一次性占用巨量内存，
+    先把瓦片保存成临时 PNG，再合成。
+  */
+  const pieces = [];
+
+  for (let y = 0; y < rows; y++) {
+    const row = [];
+
+    for (let x = 0; x < cols; x++) {
+      const remainingW = info.width - x * tw * scale;
+      const remainingH = info.height - y * th * scale;
+
+      const outW = Math.min(tw, Math.ceil(remainingW / scale));
+      const outH = Math.min(th, Math.ceil(remainingH / scale));
+
+      const url = iiifTileUrl(
+        baseUrl,
+        x,
+        y,
+        outW,
+        outH,
+        scale
+      );
+
+      const buf = await downloadBuffer(url);
+
+      const resized = await sharp(buf)
+        .resize(outW, outH, {
+          fit: "fill"
+        })
+        .png()
+        .toBuffer();
+
+      row.push({
+        input: resized,
+        left: x * tw,
+        top: y * th
+      });
+
+      job.done++;
+      job.progress = Math.round(
+        (job.done / job.total) * 100
+      );
+
+      job.status =
+        `正在拼接：${job.done}/${job.total}`;
+
+      await sleep(10);
+    }
+
+    pieces.push(row);
+  }
+
+  const composite = [];
+
+  for (const row of pieces) {
+    for (const p of row) {
+      composite.push({
+        input: p.input,
+        left: p.left,
+        top: p.top
+      });
+    }
+  }
+
+  const output = await sharp({
+    create: {
+      width: info.width,
+      height: info.height,
+      channels: 3,
+      background: {
+        r: 255,
+        g: 255,
+        b: 255
+      }
+    }
+  })
+    .composite(composite)
+    .jpeg({
+      quality: 95,
+      chromaSubsampling: "4:4:4"
+    })
+    .toBuffer();
+
+  job.status = "完成";
+  job.progress = 100;
+
+  return output;
 }
 
-function getMaxLevel(width, height) {
-  return Math.ceil(
-    Math.log2(
-      Math.max(width, height)
-    )
-  );
-}
+app.post("/api/start", async (req, res) => {
+  try {
+    const input = String(req.body?.url || "").trim();
 
-function levelSize(width, height, level) {
-  const maxLevel =
-    getMaxLevel(width, height);
-
-  const scale =
-    Math.pow(
-      2,
-      maxLevel - level
-    );
-
-  return {
-    width: Math.ceil(width / scale),
-    height: Math.ceil(height / scale)
-  };
-}
-
-function makeTileUrl(
-  dziUrl,
-  level,
-  x,
-  y,
-  format
-) {
-  const u =
-    new URL(dziUrl);
-
-  const base =
-    u.pathname.replace(
-      /\.dzi$/i,
-      ""
-    );
-
-  u.pathname =
-    `${base}_files/${level}/${x}_${y}.${format}`;
-
-  return u.toString();
-}
-
-async function prepareTile(
-  buffer,
-  x,
-  y,
-  level,
-  metadata
-) {
-  const {
-    width,
-    height,
-    tileSize,
-    overlap
-  } = metadata;
-
-  const size =
-    levelSize(
-      width,
-      height,
-      level
-    );
-
-  const columns =
-    Math.ceil(
-      size.width /
-      tileSize
-    );
-
-  const rows =
-    Math.ceil(
-      size.height /
-      tileSize
-    );
-
-  const left =
-    x === 0 ? 0 : overlap;
-
-  const top =
-    y === 0 ? 0 : overlap;
-
-  const right =
-    x === columns - 1
-      ? 0
-      : overlap;
-
-  const bottom =
-    y === rows - 1
-      ? 0
-      : overlap;
-
-  const image =
-    sharp(buffer);
-
-  const info =
-    await image.metadata();
-
-  const actualWidth =
-    info.width || tileSize;
-
-  const actualHeight =
-    info.height || tileSize;
-
-  const cropWidth =
-    Math.max(
-      1,
-      actualWidth -
-      left -
-      right
-    );
-
-  const cropHeight =
-    Math.max(
-      1,
-      actualHeight -
-      top -
-      bottom
-    );
-
-  const output =
-    await image
-      .extract({
-        left,
-        top,
-        width: cropWidth,
-        height: cropHeight
-      })
-      .png()
-      .toBuffer();
-
-  return {
-    buffer: output,
-    left:
-      x * tileSize + left,
-    top:
-      y * tileSize + top
-  };
-}
-
-app.post(
-  "/api/jobs",
-  async (req, res) => {
-    const dzi =
-      String(
-        req.body?.dzi || ""
-      ).trim();
-
-    if (
-      !/^https?:\/\//i.test(dzi)
-    ) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "请输入完整的 HTTP/HTTPS DZI 地址"
-        });
+    if (!input) {
+      return res.status(400).json({
+        error: "请输入图片服务地址"
+      });
     }
 
     const id =
-      makeId();
+      Date.now().toString(36) +
+      Math.random().toString(36).slice(2, 8);
 
     jobs.set(id, {
-      status: "starting",
+      status: "准备开始",
       progress: 0,
-      message:
-        "准备开始……"
+      done: 0,
+      total: 0,
+      buffer: null,
+      error: null
     });
 
     res.json({ id });
 
-    runJob(id, dzi)
-      .catch(error => {
-        console.error(error);
+    const job = jobs.get(id);
 
-        updateJob(id, {
-          status: "error",
-          message:
-            error.message ||
-            String(error)
-        });
-      });
-  }
-);
-
-app.get(
-  "/api/jobs/:id",
-  (req, res) => {
-    const job =
-      jobs.get(
-        req.params.id
-      );
-
-    if (!job) {
-      return res
-        .status(404)
-        .json({
-          error:
-            "任务不存在"
-        });
+    try {
+      job.buffer = await makeImage(input, job);
+    } catch (err) {
+      job.error = err.message || String(err);
+      job.status = "失败";
     }
-
-    res.json(job);
+  } catch (err) {
+    res.status(500).json({
+      error: err.message || String(err)
+    });
   }
-);
+});
 
-app.get(
-  "/api/jobs/:id/download",
-  (req, res) => {
-    const job =
-      jobs.get(
-        req.params.id
-      );
+app.get("/api/status/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
 
-    if (
-      !job ||
-      job.status !== "done" ||
-      !job.output
-    ) {
-      return res
-        .status(404)
-        .send(
-          "文件尚未生成"
-        );
-    }
-
-    res.download(
-      job.output,
-      "deepzoom-full.png"
-    );
+  if (!job) {
+    return res.status(404).json({
+      error: "任务不存在"
+    });
   }
-);
 
-async function runJob(
-  id,
-  dziUrl
-) {
-  updateJob(id, {
-    status: "reading",
-    progress: 2,
-    message:
-      "正在读取 DZI……"
+  res.json({
+    status: job.status,
+    progress: job.progress,
+    done: job.done,
+    total: job.total,
+    error: job.error,
+    ready: !!job.buffer
   });
+});
 
-  const xml =
-    await getText(dziUrl);
+app.get("/api/download/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
 
-  const metadata =
-    parseDzi(xml);
+  if (!job || !job.buffer) {
+    return res.status(404).send("文件还没有准备好");
+  }
 
-  const {
-    width,
-    height,
-    tileSize,
-    format
-  } = metadata;
-
-  const level =
-    getMaxLevel(
-      width,
-      height
-    );
-
-  const finalSize =
-    levelSize(
-      width,
-      height,
-      level
-    );
-
-  const columns =
-    Math.ceil(
-      finalSize.width /
-      tileSize
-    );
-
-  const rows =
-    Math.ceil(
-      finalSize.height /
-      tileSize
-    );
-
-  const total =
-    columns * rows;
-
-  updateJob(id, {
-    status: "downloading",
-    progress: 5,
-    message:
-      `原图：${width} × ${height}\n` +
-      `最高 Level：${level}\n` +
-      `瓦片：${columns} × ${rows}\n` +
-      `共 ${total} 张`
-  });
-
-  const jobDir =
-    path.join(
-      JOB_DIR,
-      id
-    );
-
-  fs.mkdirSync(
-    jobDir,
-    { recursive: true }
+  res.setHeader(
+    "Content-Type",
+    "image/jpeg"
   );
 
-  const pieces = [];
+  res.setHeader(
+    "Content-Disposition",
+    'attachment; filename="full-resolution.jpg"'
+  );
 
-  let completed = 0;
+  res.send(job.buffer);
+});
 
-  const BATCH = 100;
-
-  for (
-    let start = 0;
-    start < total;
-    start += BATCH
-  ) {
-    const end =
-      Math.min(
-        total,
-        start + BATCH
-      );
-
-    const composites = [];
-
-    for (
-      let index = start;
-      index < end;
-      index++
-    ) {
-      const x =
-        index % columns;
-
-      const y =
-        Math.floor(
-          index / columns
-        );
-
-      const url =
-        makeTileUrl(
-          dziUrl,
-          level,
-          x,
-          y,
-          format
-        );
-
-      try {
-        const buffer =
-          await getBuffer(url);
-
-        const tile =
-          await prepareTile(
-            buffer,
-            x,
-            y,
-            level,
-            metadata
-          );
-
-        composites.push(tile);
-      } catch (error) {
-        console.warn(
-          "瓦片失败:",
-          x,
-          y,
-          error.message
-        );
-      }
-
-      completed++;
-
-      updateJob(id, {
-        progress:
-          5 +
-          Math.floor(
-            (completed / total) *
-            75
-          ),
-        message:
-          `正在下载瓦片……\n` +
-          `${completed} / ${total}`
-      });
-    }
-
-    if (composites.length) {
-      const piece =
-        path.join(
-          jobDir,
-          `piece-${start}.png`
-        );
-
-      await sharp({
-        create: {
-          width:
-            finalSize.width,
-          height:
-            finalSize.height,
-          channels: 4,
-          background: {
-            r: 0,
-            g: 0,
-            b: 0,
-            alpha: 0
-          }
-        }
-      })
-        .composite(
-          composites.map(
-            x => ({
-              input: x.buffer,
-              left: x.left,
-              top: x.top
-            })
-          )
-        )
-        .png()
-        .toFile(piece);
-
-      pieces.push(piece);
-    }
-  }
-
-  updateJob(id, {
-    status: "merging",
-    progress: 85,
-    message:
-      "正在生成最终高清图……"
-  });
-
-  const output =
-    path.join(
-      jobDir,
-      "full.png"
-    );
-
-  await sharp({
-    create: {
-      width:
-        finalSize.width,
-      height:
-        finalSize.height,
-      channels: 4,
-      background: {
-        r: 255,
-        g: 255,
-        b: 255,
-        alpha: 1
-      }
-    }
-  })
-    .composite(
-      pieces.map(
-        piece => ({
-          input: piece,
-          left: 0,
-          top: 0
-        })
-      )
-    )
-    .png({
-      compressionLevel: 6
-    })
-    .toFile(output);
-
-  updateJob(id, {
-    status: "done",
-    progress: 100,
-    message:
-      `完成！\n` +
-      `最终尺寸：${finalSize.width} × ${finalSize.height}`,
-    output
-  });
-}
-
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `DZI 拼图器运行于 http://localhost:${PORT}`
-    );
-  }
-);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
