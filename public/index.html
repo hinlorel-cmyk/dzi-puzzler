@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DZI 高清图拼图器</title>
+
+<style>
+body{
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  max-width:720px;
+  margin:0 auto;
+  padding:20px;
+  background:#f6f7f9;
+  color:#111;
+}
+
+.card{
+  background:white;
+  border-radius:16px;
+  padding:20px;
+  box-shadow:0 4px 18px #00000012;
+}
+
+h1{
+  font-size:24px;
+  margin-top:0;
+}
+
+input,button{
+  width:100%;
+  box-sizing:border-box;
+  font-size:16px;
+  padding:13px;
+  border-radius:10px;
+}
+
+input{
+  border:1px solid #ccc;
+  margin:8px 0;
+}
+
+button{
+  border:0;
+  background:#111;
+  color:white;
+  margin-top:8px;
+}
+
+button:disabled{
+  opacity:.5;
+}
+
+.progress{
+  height:12px;
+  background:#eee;
+  border-radius:99px;
+  overflow:hidden;
+  margin:16px 0;
+}
+
+.bar{
+  height:100%;
+  width:0;
+  background:#111;
+  transition:width .2s;
+}
+
+#message{
+  white-space:pre-wrap;
+  color:#555;
+  font-size:14px;
+}
+
+a{
+  display:block;
+  margin-top:14px;
+  text-align:center;
+  padding:13px;
+  background:#111;
+  color:#fff;
+  border-radius:10px;
+  text-decoration:none;
+}
+
+.small{
+  font-size:13px;
+  color:#777;
+  line-height:1.5;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+<h1>DZI 高清图拼图器</h1>
+
+<p class="small">
+输入一个可以公开访问的 .dzi 地址，
+服务器会读取最高级别的 Deep Zoom 瓦片，
+并尝试拼成完整 PNG。
+</p>
+
+<input
+  id="url"
+  placeholder="https://example.com/image.dzi"
+>
+
+<button id="start">
+开始生成高清图
+</button>
+
+<div class="progress">
+  <div class="bar" id="bar"></div>
+</div>
+
+<div id="message">
+等待开始
+</div>
+
+<div id="download"></div>
+
+</div>
+
+<script>
+
+const urlInput =
+  document.getElementById("url");
+
+const start =
+  document.getElementById("start");
+
+const bar =
+  document.getElementById("bar");
+
+const message =
+  document.getElementById("message");
+
+const download =
+  document.getElementById("download");
+
+const params =
+  new URLSearchParams(
+    location.search
+  );
+
+if(params.get("dzi")){
+  urlInput.value =
+    params.get("dzi");
+}
+
+start.onclick =
+async function(){
+
+  const dzi =
+    urlInput.value.trim();
+
+  if(!/^https?:\/\//i.test(dzi)){
+
+    message.textContent =
+      "请输入完整的 HTTP/HTTPS DZI 地址";
+
+    return;
+  }
+
+  start.disabled = true;
+
+  download.innerHTML = "";
+
+  bar.style.width = "2%";
+
+  message.textContent =
+    "正在创建任务……";
+
+  try{
+
+    const response =
+      await fetch(
+        "/api/jobs",
+        {
+          method:"POST",
+          headers:{
+            "Content-Type":
+              "application/json"
+          },
+          body:
+            JSON.stringify({
+              dzi:dzi
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if(!response.ok){
+
+      throw new Error(
+        data.error ||
+        "创建任务失败"
+      );
+
+    }
+
+    poll(data.id);
+
+  }catch(error){
+
+    message.textContent =
+      error.message;
+
+    start.disabled = false;
+
+  }
+
+};
+
+async function poll(id){
+
+  try{
+
+    const response =
+      await fetch(
+        "/api/jobs/" + id
+      );
+
+    const job =
+      await response.json();
+
+    bar.style.width =
+      (job.progress || 0) + "%";
+
+    message.textContent =
+      job.message ||
+      job.status;
+
+    if(job.status === "done"){
+
+      download.innerHTML =
+        '<a href="/api/jobs/' +
+        id +
+        '/download">' +
+        '下载完整高清 PNG' +
+        '</a>';
+
+      start.disabled = false;
+
+      return;
+    }
+
+    if(job.status === "error"){
+
+      start.disabled = false;
+
+      return;
+    }
+
+    setTimeout(
+      function(){
+        poll(id);
+      },
+      1000
+    );
+
+  }catch(error){
+
+    message.textContent =
+      "读取进度失败：" +
+      error.message;
+
+    start.disabled = false;
+
+  }
+
+}
+
+</script>
+
+</body>
+</html>
