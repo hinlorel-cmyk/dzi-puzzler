@@ -3,522 +3,454 @@ import { chromium } from "playwright";
 import sharp from "sharp";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 app.use(express.static("public"));
 
 const PORT = process.env.PORT || 10000;
 
-function isHttpUrl(s) {
-  try {
-    const u = new URL(s);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch {
-    return false;
-  }
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/140.0 Safari/537.36";
+
+function fail(msg) {
+  const e = new Error(msg);
+  e.public = true;
+  return e;
 }
 
-function looksLikeDeepZoom(obj) {
-  if (!obj || typeof obj !== "object") return false;
+/* ---------------- 瓦片 URL 解析 ---------------- */
 
-  const keys = Object.keys(obj).map(k => k.toLowerCase());
-
-  const hasUrl =
-    keys.includes("url") ||
-    keys.includes("tileurl") ||
-    keys.includes("tilesurl");
-
-  const hasSize =
-    keys.includes("size") ||
-    (keys.includes("width") && keys.includes("height"));
-
-  const hasTile =
-    keys.includes("tilesize") ||
-    keys.includes("tile_size");
-
-  return hasUrl && hasSize && hasTile;
-}
-
-function findDeepZoomObjects(root) {
-  const results = [];
-  const seen = new WeakSet();
-
-  function walk(value, path, depth) {
-    if (!value || typeof value !== "object") return;
-    if (depth > 8) return;
-    if (seen.has(value)) return;
-
-    seen.add(value);
-
-    try {
-      if (looksLikeDeepZoom(value)) {
-        results.push({
-          path,
-          value
-        });
-      }
-    } catch {}
-
-    let keys = [];
-    try {
-      keys = Object.keys(value);
-    } catch {
-      return;
-    }
-
-    for (const key of keys.slice(0, 300)) {
-      let child;
-
-      try {
-        child = value[key];
-      } catch {
-        continue;
-      }
-
-      if (
-        child &&
-        typeof child === "object" &&
-        !Array.isArray(child)
-      ) {
-        walk(child, `${path}.${key}`, depth + 1);
-      }
-    }
-  }
-
-  walk(root, "window", 0);
-  return results;
-}
-
-function normalizeSource(x) {
-  if (!x || typeof x !== "object") return null;
-
-  let url =
-    x.Url ??
-    x.url ??
-    x.TileUrl ??
-    x.tileUrl ??
-    x.TilesUrl ??
-    x.tilesUrl;
-
-  let width;
-  let height;
-
-  const size = x.Size ?? x.size;
-
-  if (size && typeof size === "object") {
-    width = Number(size.Width ?? size.width);
-    height = Number(size.Height ?? size.height);
-  }
-
-  if (!width) width = Number(x.Width ?? x.width);
-  if (!height) height = Number(x.Height ?? x.height);
-
-  const tileSize = Number(
-    x.TileSize ??
-    x.tileSize ??
-    x.tile_size
+function parseTile(url) {
+  const m = url.match(
+    /\/(\d+)\/(\d+)_(\d+)\.(jpg|jpeg|png|webp)(?:[?#].*)?$/i
   );
-
-  const overlap = Number(
-    x.Overlap ??
-    x.overlap ??
-    0
-  );
-
-  const format =
-    x.Format ??
-    x.format ??
-    "jpg";
-
-  if (!url || !Number.isFinite(width) || !Number.isFinite(height)) {
-    return null;
-  }
-
-  if (!isHttpUrl(url)) return null;
+  if (!m) return null;
 
   return {
     url,
-    width,
-    height,
-    tileSize: Number.isFinite(tileSize) && tileSize > 0 ? tileSize : 256,
-    overlap: Number.isFinite(overlap) ? overlap : 0,
-    format
+    level: Number(m[1]),
+    x: Number(m[2]),
+    y: Number(m[3]),
+    format: m[4].toLowerCase(),
+    root: url.replace(
+      /\/\d+\/\d+_\d+\.(jpg|jpeg|png|webp)(?:[?#].*)?$/i,
+      ""
+    )
   };
 }
 
-function deepZoomLevel(width, height) {
-  return Math.ceil(Math.log2(Math.max(width, height)));
-}
-
-function tileCount(size, tileSize) {
-  return Math.ceil(size / tileSize);
-}
-
-function makeTileUrl(base, level, x, y, format) {
-  let root = base;
-
-  if (!root.endsWith("/")) root += "/";
-
-  return `${root}${level}/${x}_${y}.${format}`;
-}
-
-async function downloadTile(context, url) {
-  const response = await context.request.get(url);
-
-  if (!response.ok()) {
-    throw new Error(`Tile HTTP ${response.status()}`);
+function groupTiles(urls) {
+  const groups = new Map();
+  for (const u of urls) {
+    const t = parseTile(u);
+    if (!t) continue;
+    if (!groups.has(t.root)) groups.set(t.root, []);
+    groups.get(t.root).push(t);
   }
-
-  return await response.body();
+  return [...groups.values()]
+    .map(tiles => ({
+      root: tiles[0].root,
+      format: tiles[0].format,
+      maxCapturedLevel: Math.max(...tiles.map(t => t.level)),
+      tiles
+    }))
+    .sort((a, b) => b.tiles.length - a.tiles.length);
 }
 
-async function assembleDeepZoom(source, context) {
-  const {
-    url,
-    width,
-    height,
-    tileSize,
-    format
-  } = source;
+/* ---------------- Playwright 捕获 ---------------- */
 
-  const level = deepZoomLevel(width, height);
-
-  const scale = Math.pow(
-    2,
-    level - Math.ceil(Math.log2(Math.max(width, height)))
-  );
-
-  const levelWidth = Math.ceil(width * scale);
-  const levelHeight = Math.ceil(height * scale);
-
-  const cols = tileCount(levelWidth, tileSize);
-  const rows = tileCount(levelHeight, tileSize);
-
-  if (cols * rows > 10000) {
-    throw new Error(
-      `最高层需要 ${cols * rows} 张瓦片，数量过大，已停止。`
-    );
-  }
-
-  const tiles = [];
-
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      const tileUrl = makeTileUrl(
-        url,
-        level,
-        x,
-        y,
-        format
-      );
-
-      tiles.push({
-        x,
-        y,
-        url: tileUrl
-      });
-    }
-  }
-
-  const canvas = sharp({
-    create: {
-      width: levelWidth,
-      height: levelHeight,
-      channels: 3,
-      background: { r: 255, g: 255, b: 255 }
-    }
+async function captureTiles(pageUrl) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage"
+    ]
   });
 
-  const composites = [];
-
-  for (const tile of tiles) {
-    const buffer = await downloadTile(
-      context,
-      tile.url
-    );
-
-    const metadata = await sharp(buffer).metadata();
-
-    composites.push({
-      input: buffer,
-      left: tile.x * tileSize,
-      top: tile.y * tileSize,
-      blend: "over"
-    });
-
-    if (!metadata.width || !metadata.height) {
-      throw new Error("无法读取瓦片尺寸");
-    }
-  }
-
-  return await canvas
-    .composite(composites)
-    .jpeg({
-      quality: 95,
-      chromaSubsampling: "4:4:4"
-    })
-    .toBuffer();
-}
-
-app.post("/api/analyze", async (req, res) => {
-  const input = String(req.body?.url || "").trim();
-
-  if (!isHttpUrl(input)) {
-    return res.status(400).json({
-      error: "请输入完整的网址。"
-    });
-  }
-
-  let browser;
-
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-      ]
-    });
-
     const context = await browser.newContext({
-      viewport: {
-        width: 1440,
-        height: 1000
-      },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+      viewport: { width: 1600, height: 1200 },
+      userAgent: UA
     });
-
     const page = await context.newPage();
+    const requests = new Set();
 
-    const networkUrls = [];
-
-    page.on("request", request => {
-      const u = request.url();
-
-      if (
-        u.includes("image-bundle") ||
-        u.includes(".dzi") ||
-        u.includes("zoom") ||
-        u.includes("_")
-      ) {
-        networkUrls.push(u);
+    page.on("request", req => {
+      const u = req.url();
+      if (/\.(jpg|jpeg|png|webp)(?:[?#]|$)/i.test(u)) {
+        requests.add(u);
       }
     });
 
-    await page.goto(input, {
+    await page.goto(pageUrl, {
       waitUntil: "domcontentloaded",
       timeout: 60000
     });
 
+    // 等 viewer 初始化
     await page.waitForTimeout(8000);
 
-    const candidates = await page.evaluate(() => {
-      function isCandidate(x) {
-        if (!x || typeof x !== "object") return false;
-
-        const keys = Object.keys(x).map(k =>
-          k.toLowerCase()
-        );
-
-        return (
-          keys.includes("url") &&
-          (
-            keys.includes("tilesize") ||
-            keys.includes("size")
-          )
-        );
-      }
-
-      const found = [];
-      const seen = new WeakSet();
-
-      function walk(value, path, depth) {
-        if (!value || typeof value !== "object") return;
-        if (depth > 7) return;
-
-        if (seen.has(value)) return;
-        seen.add(value);
-
-        try {
-          if (isCandidate(value)) {
-            const copy = {};
-
-            for (const key of Object.keys(value)) {
-              const v = value[key];
-
-              if (
-                typeof v === "string" ||
-                typeof v === "number" ||
-                typeof v === "boolean"
-              ) {
-                copy[key] = v;
-              } else if (
-                v &&
-                typeof v === "object" &&
-                !Array.isArray(v)
-              ) {
-                const sub = {};
-
-                for (const k of Object.keys(v)) {
-                  const sv = v[k];
-
-                  if (
-                    typeof sv === "string" ||
-                    typeof sv === "number"
-                  ) {
-                    sub[k] = sv;
-                  }
-                }
-
-                copy[key] = sub;
-              }
-            }
-
-            found.push({
-              path,
-              value: copy
-            });
-          }
-        } catch {}
-
-        let keys;
-
-        try {
-          keys = Object.keys(value);
-        } catch {
-          return;
-        }
-
-        for (const key of keys.slice(0, 500)) {
-          let child;
-
-          try {
-            child = value[key];
-          } catch {
-            continue;
-          }
-
-          if (
-            child &&
-            typeof child === "object"
-          ) {
-            walk(
-              child,
-              `${path}.${key}`,
-              depth + 1
-            );
-          }
-        }
-      }
-
-      walk(window, "window", 0);
-
-      return found;
+    // 滚一遍触发懒加载
+    await page.evaluate(async () => {
+      window.scrollTo(0, document.body.scrollHeight);
+      await new Promise(r => setTimeout(r, 1000));
+      window.scrollTo(0, 0);
+      await new Promise(r => setTimeout(r, 1000));
     });
 
-    const normalized = [];
+    await page.waitForTimeout(3000);
 
-    for (const item of candidates) {
-      const source = normalizeSource(item.value);
+    return [...requests];
+  } finally {
+    await browser.close();
+  }
+}
 
-      if (source) {
-        normalized.push({
-          path: item.path,
-          source
-        });
-      }
+/* ---------------- 带 Referer 的下载 ---------------- */
+
+async function fetchBuf(url, referer) {
+  const headers = {
+    "User-Agent": UA,
+    "Accept":
+      "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9"
+  };
+  if (referer) headers.Referer = referer;
+
+  const r = await fetch(url, { headers });
+  if (!r.ok) {
+    const e = new Error(`HTTP ${r.status}: ${url}`);
+    e.status = r.status;
+    e.public = true;
+    throw e;
+  }
+  return Buffer.from(await r.arrayBuffer());
+}
+
+/* ---------------- 尝试拿 DZI ---------------- */
+
+async function tryFetchDzi(root, referer) {
+  const rootClean = root.replace(/\/+$/, "");
+  const candidates = [];
+
+  if (rootClean.endsWith("_files")) {
+    candidates.push(rootClean.slice(0, -6) + ".dzi");
+  }
+  candidates.push(rootClean + ".dzi");
+
+  for (const url of candidates) {
+    try {
+      const buf = await fetchBuf(url, referer);
+      const text = buf.toString("utf8");
+      if (/<Image\b/i.test(text)) return { url, xml: text };
+    } catch {}
+  }
+  return null;
+}
+
+function parseDziXml(xml, dziUrl) {
+  const image = xml.match(/<Image\b[^>]*>/i)?.[0];
+  if (!image) throw fail("DZI XML 无效");
+
+  const size = xml.match(
+    /<Size\b[^>]*Width=["'](\d+)["'][^>]*Height=["'](\d+)["']/i
+  );
+  if (!size) throw fail("DZI 缺少 Size");
+
+  const tileSize =
+    Number(image.match(/TileSize=["'](\d+)["']/i)?.[1]) || 256;
+  const overlap =
+    Number(image.match(/Overlap=["'](\d+)["']/i)?.[1]) || 0;
+  const format =
+    image.match(/Format=["']([^"']+)["']/i)?.[1] || "jpg";
+
+  const width = Number(size[1]);
+  const height = Number(size[2]);
+
+  const u = new URL(dziUrl);
+  const basePath = u.pathname.replace(/\.dzi$/i, "");
+  const tileRoot = `${u.origin}${basePath}_files`;
+
+  return {
+    width,
+    height,
+    tileSize,
+    overlap,
+    format,
+    tileRoot,
+    maxLevel: Math.ceil(Math.log2(Math.max(width, height))),
+    referer: u.origin + "/"
+  };
+}
+
+/* ---------------- 无 DZI 时探测瓦片 ---------------- */
+
+async function probeTiles(group, referer) {
+  const { root, format, maxCapturedLevel, tiles: captured } = group;
+  const rootClean = root.replace(/\/+$/, "");
+
+  // 1. 从最高捕获层级往上探，找真正的 maxLevel
+  let maxLevel = maxCapturedLevel;
+  for (let i = 0; i < 12; i++) {
+    const next = maxLevel + 1;
+    try {
+      const buf = await fetchBuf(
+        `${rootClean}/${next}/0_0.${format}`,
+        referer
+      );
+      const meta = await sharp(buf).metadata();
+      if (meta.width && meta.height) maxLevel = next;
+      else break;
+    } catch {
+      break;
     }
+  }
 
-    if (!normalized.length) {
-      return res.json({
-        ok: false,
-        message:
-          "页面已经打开，但没有找到可识别的 Deep Zoom 参数。",
-        network: networkUrls.slice(0, 100)
+  // 2. 用已捕获的瓦片得到网格下界
+  let minCols = 1, minRows = 1;
+  for (const t of captured) {
+    if (t.level === maxLevel) {
+      minCols = Math.max(minCols, t.x + 1);
+      minRows = Math.max(minRows, t.y + 1);
+    }
+  }
+
+  async function getMeta(x, y) {
+    try {
+      const buf = await fetchBuf(
+        `${rootClean}/${maxLevel}/${x}_${y}.${format}`,
+        referer
+      );
+      return await sharp(buf).metadata();
+    } catch {
+      return null;
+    }
+  }
+
+  // 3. 探测完整网格
+  let cols = minCols;
+  while (cols < 300) {
+    if (!(await getMeta(cols, 0))) break;
+    cols++;
+  }
+
+  let rows = minRows;
+  while (rows < 300) {
+    if (!(await getMeta(0, rows))) break;
+    rows++;
+  }
+
+  // 4. 拿角落瓦片
+  const firstMeta = await getMeta(0, 0);
+  const lastMeta = await getMeta(cols - 1, rows - 1);
+  if (!firstMeta || !lastMeta) throw fail("无法确定瓦片尺寸");
+
+  // 5. 推断 tileSize
+  let tileSize = 256;
+  if (cols > 1) {
+    if (firstMeta.width === 512) tileSize = 512;
+    else if (firstMeta.width === 256) tileSize = 256;
+    else tileSize = firstMeta.width;
+  }
+
+  const width =
+    cols === 1
+      ? firstMeta.width
+      : (cols - 1) * tileSize + lastMeta.width;
+  const height =
+    rows === 1
+      ? firstMeta.height
+      : (rows - 1) * tileSize + lastMeta.height;
+
+  return {
+    width,
+    height,
+    tileSize,
+    overlap: 0,
+    format,
+    tileRoot: rootClean,
+    maxLevel,
+    referer
+  };
+}
+
+/* ---------------- 拼接（修复 overlap） ---------------- */
+
+async function buildImage(src) {
+  const {
+    width,
+    height,
+    tileSize,
+    overlap,
+    format,
+    tileRoot,
+    maxLevel,
+    referer
+  } = src;
+
+  const cols = Math.ceil(width / tileSize);
+  const rows = Math.ceil(height / tileSize);
+  const total = cols * rows;
+
+  if (total > 8000) {
+    throw fail(`瓦片数量 ${total} 过多（> 8000），已拒绝。`);
+  }
+
+  const composites = [];
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const url = `${tileRoot}/${maxLevel}/${x}_${y}.${format}`;
+      const buf = await fetchBuf(url, referer);
+      const meta = await sharp(buf).metadata();
+
+      // Deep Zoom：每块瓦片四周含 overlap 像素
+      // 拼接时，除第一行/第一列以外都要裁掉 overlap
+      const cropLeft = x > 0 ? overlap : 0;
+      const cropTop = y > 0 ? overlap : 0;
+
+      // 该瓦片在画布上应覆盖的内容尺寸
+      const contentW = Math.min(tileSize, width - x * tileSize);
+      const contentH = Math.min(tileSize, height - y * tileSize);
+
+      // 从瓦片图上裁出来实际需要的内容
+      const cropW = Math.min(contentW, meta.width - cropLeft);
+      const cropH = Math.min(contentH, meta.height - cropTop);
+
+      let processed = buf;
+      const needCrop =
+        cropLeft > 0 ||
+        cropTop > 0 ||
+        cropW !== meta.width ||
+        cropH !== meta.height;
+
+      if (needCrop) {
+        processed = await sharp(buf)
+          .extract({
+            left: cropLeft,
+            top: cropTop,
+            width: cropW,
+            height: cropH
+          })
+          .toBuffer();
+      }
+
+      composites.push({
+        input: processed,
+        left: x * tileSize,
+        top: y * tileSize
       });
     }
+  }
 
-    normalized.sort(
-      (a, b) =>
-        b.source.width * b.source.height -
-        a.source.width * a.source.height
-    );
-
-    const best = normalized[0];
-
-    return res.json({
-      ok: true,
-      source: best.source,
-      path: best.path,
-      candidates: normalized.slice(0, 10),
-      network: networkUrls.slice(0, 100)
-    });
-
-  } catch (err) {
-    return res.status(500).json({
-      error: err.message || String(err)
-    });
-  } finally {
-    if (browser) {
-      await browser.close();
+  return sharp({
+    create: {
+      width,
+      height,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 }
     }
+  })
+    .composite(composites)
+    .jpeg({ quality: 95, chromaSubsampling: "4:4:4" })
+    .toBuffer();
+}
+
+/* ---------------- 公共：从页面 URL 解析出 source ---------------- */
+
+async function resolveSource(pageUrl) {
+  const urls = await captureTiles(pageUrl);
+  const groups = groupTiles(urls);
+
+  if (!groups.length) {
+    throw fail(
+      "没捕获到瓦片。可能页面需要登录，或不是 Deep Zoom 结构。"
+    );
+  }
+
+  const referer = new URL(pageUrl).origin + "/";
+
+  // 依次尝试每组
+  for (const g of groups) {
+    // 先试 DZI
+    const dzi = await tryFetchDzi(g.root, referer);
+    if (dzi) {
+      try {
+        const src = parseDziXml(dzi.xml, dzi.url);
+        src.referer = referer;
+        return src;
+      } catch {}
+    }
+
+    // 再试探测
+    try {
+      return await probeTiles(g, referer);
+    } catch {}
+  }
+
+  throw fail("找到了瓦片请求，但无法推断出可拼接的参数。");
+}
+
+/* ---------------- API ---------------- */
+
+app.post("/api/analyze", async (req, res) => {
+  const pageUrl = String(req.body?.url || "").trim();
+  if (!/^https?:\/\//i.test(pageUrl)) {
+    return res.status(400).json({ ok: false, error: "网址格式不正确" });
+  }
+
+  try {
+    const src = await resolveSource(pageUrl);
+    const cols = Math.ceil(src.width / src.tileSize);
+    const rows = Math.ceil(src.height / src.tileSize);
+
+    res.json({
+      ok: true,
+      width: src.width,
+      height: src.height,
+      tileSize: src.tileSize,
+      overlap: src.overlap,
+      format: src.format,
+      maxLevel: src.maxLevel,
+      columns: cols,
+      rows,
+      tiles: cols * rows
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.public ? e.message : e.message || String(e)
+    });
   }
 });
 
 app.post("/api/download", async (req, res) => {
-  const source = req.body?.source;
-
-  if (!source || !source.url) {
-    return res.status(400).json({
-      error: "没有可下载的图像源。"
-    });
+  const pageUrl = String(req.body?.url || "").trim();
+  if (!/^https?:\/\//i.test(pageUrl)) {
+    return res.status(400).json({ ok: false, error: "网址格式不正确" });
   }
 
-  let browser;
-
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-      ]
-    });
+    const src = await resolveSource(pageUrl);
+    const buf = await buildImage(src);
 
-    const context = await browser.newContext();
-
-    const buffer = await assembleDeepZoom(
-      source,
-      context
-    );
-
-    res.setHeader(
-      "Content-Type",
-      "image/jpeg"
-    );
-
-    res.setHeader(
+    res.set("Content-Type", "image/jpeg");
+    res.set(
       "Content-Disposition",
-      'attachment; filename="dpm-full.jpg"'
+      'attachment; filename="image.jpg"'
     );
-
-    res.send(buffer);
-
-  } catch (err) {
+    res.send(buf);
+  } catch (e) {
     res.status(500).json({
-      error: err.message || String(err)
+      ok: false,
+      error: e.public ? e.message : e.message || String(e)
     });
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
 });
 
 app.listen(PORT, () => {
-  console.log(
-    `Server running on port ${PORT}`
-  );
+  console.log(`Server running on port ${PORT}`);
 });
