@@ -1,281 +1,283 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DZI 高清图拼图器</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>高清图拼图器</title>
 
-<style>
-body{
-  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-  max-width:720px;
-  margin:0 auto;
-  padding:20px;
-  background:#f6f7f9;
-  color:#111;
-}
+  <style>
+    * {
+      box-sizing: border-box;
+    }
 
-.card{
-  background:white;
-  border-radius:16px;
-  padding:20px;
-  box-shadow:0 4px 18px #00000012;
-}
+    body {
+      margin: 0;
+      background: #f5f5f5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #222;
+    }
 
-h1{
-  font-size:24px;
-  margin-top:0;
-}
+    .wrap {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 22px 16px 40px;
+    }
 
-input,button{
-  width:100%;
-  box-sizing:border-box;
-  font-size:16px;
-  padding:13px;
-  border-radius:10px;
-}
+    h1 {
+      font-size: 24px;
+      margin: 10px 0 8px;
+    }
 
-input{
-  border:1px solid #ccc;
-  margin:8px 0;
-}
+    .desc {
+      color: #666;
+      font-size: 14px;
+      line-height: 1.7;
+      margin-bottom: 20px;
+    }
 
-button{
-  border:0;
-  background:#111;
-  color:white;
-  margin-top:8px;
-}
+    textarea {
+      width: 100%;
+      min-height: 110px;
+      padding: 13px;
+      border: 1px solid #ccc;
+      border-radius: 10px;
+      background: white;
+      font-size: 14px;
+      line-height: 1.5;
+      resize: vertical;
+      outline: none;
+    }
 
-button:disabled{
-  opacity:.5;
-}
+    textarea:focus {
+      border-color: #666;
+    }
 
-.progress{
-  height:12px;
-  background:#eee;
-  border-radius:99px;
-  overflow:hidden;
-  margin:16px 0;
-}
+    button {
+      width: 100%;
+      margin-top: 12px;
+      padding: 14px;
+      border: 0;
+      border-radius: 10px;
+      background: #222;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
 
-.bar{
-  height:100%;
-  width:0;
-  background:#111;
-  transition:width .2s;
-}
+    button:disabled {
+      opacity: 0.5;
+    }
 
-#message{
-  white-space:pre-wrap;
-  color:#555;
-  font-size:14px;
-}
+    .box {
+      margin-top: 18px;
+      padding: 15px;
+      background: white;
+      border-radius: 10px;
+    }
 
-a{
-  display:block;
-  margin-top:14px;
-  text-align:center;
-  padding:13px;
-  background:#111;
-  color:#fff;
-  border-radius:10px;
-  text-decoration:none;
-}
+    .status {
+      font-size: 15px;
+      margin-bottom: 10px;
+    }
 
-.small{
-  font-size:13px;
-  color:#777;
-  line-height:1.5;
-}
-</style>
+    .bar {
+      height: 10px;
+      background: #ddd;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .progress {
+      height: 100%;
+      width: 0%;
+      background: #222;
+      transition: width .2s;
+    }
+
+    .error {
+      color: #b00020;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+    }
+
+    a.download {
+      display: block;
+      margin-top: 14px;
+      padding: 13px;
+      border-radius: 10px;
+      text-align: center;
+      background: #1677ff;
+      color: white;
+      text-decoration: none;
+    }
+
+    .small {
+      margin-top: 14px;
+      color: #777;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+  </style>
 </head>
 
 <body>
+  <div class="wrap">
 
-<div class="card">
+    <h1>高清图拼图器</h1>
 
-<h1>DZI 高清图拼图器</h1>
+    <div class="desc">
+      输入你有权处理的公开 IIIF 图片服务地址。
+      程序会尝试读取最高分辨率，并拼成完整图片。
+    </div>
 
-<p class="small">
-输入一个可以公开访问的 .dzi 地址，
-服务器会读取最高级别的 Deep Zoom 瓦片，
-并尝试拼成完整 PNG。
-</p>
+    <textarea id="url"
+      placeholder="例如：
+https://example.com/iiif/xxxxx/info.json"></textarea>
 
-<input
-  id="url"
-  placeholder="https://example.com/image.dzi"
->
+    <button id="start">开始生成高清图</button>
 
-<button id="start">
-开始生成高清图
-</button>
+    <div class="box">
+      <div id="status" class="status">等待开始</div>
 
-<div class="progress">
-  <div class="bar" id="bar"></div>
-</div>
+      <div class="bar">
+        <div id="progress" class="progress"></div>
+      </div>
 
-<div id="message">
-等待开始
-</div>
+      <div id="result"></div>
+    </div>
 
-<div id="download"></div>
+    <div class="small">
+      注意：网页地址（例如 iView 页面地址）不一定就是图像服务地址。
+      如果服务器无法识别，会直接显示具体原因。
+    </div>
 
-</div>
+  </div>
 
 <script>
+const startBtn = document.getElementById("start");
+const urlInput = document.getElementById("url");
+const statusEl = document.getElementById("status");
+const progressEl = document.getElementById("progress");
+const resultEl = document.getElementById("result");
 
-const urlInput =
-  document.getElementById("url");
+startBtn.addEventListener("click", async () => {
 
-const start =
-  document.getElementById("start");
+  const url = urlInput.value.trim();
 
-const bar =
-  document.getElementById("bar");
-
-const message =
-  document.getElementById("message");
-
-const download =
-  document.getElementById("download");
-
-const params =
-  new URLSearchParams(
-    location.search
-  );
-
-if(params.get("dzi")){
-  urlInput.value =
-    params.get("dzi");
-}
-
-start.onclick =
-async function(){
-
-  const dzi =
-    urlInput.value.trim();
-
-  if(!/^https?:\/\//i.test(dzi)){
-
-    message.textContent =
-      "请输入完整的 HTTP/HTTPS DZI 地址";
-
+  if (!url) {
+    statusEl.textContent = "请先输入地址";
     return;
   }
 
-  start.disabled = true;
+  startBtn.disabled = true;
+  resultEl.innerHTML = "";
+  progressEl.style.width = "0%";
+  statusEl.textContent = "正在创建任务……";
 
-  download.innerHTML = "";
+  try {
 
-  bar.style.width = "2%";
-
-  message.textContent =
-    "正在创建任务……";
-
-  try{
-
-    const response =
-      await fetch(
-        "/api/jobs",
-        {
-          method:"POST",
-          headers:{
-            "Content-Type":
-              "application/json"
-          },
-          body:
-            JSON.stringify({
-              dzi:dzi
-            })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if(!response.ok){
-
-      throw new Error(
-        data.error ||
-        "创建任务失败"
-      );
-
-    }
-
-    poll(data.id);
-
-  }catch(error){
-
-    message.textContent =
-      error.message;
-
-    start.disabled = false;
-
-  }
-
-};
-
-async function poll(id){
-
-  try{
-
-    const response =
-      await fetch(
-        "/api/jobs/" + id
-      );
-
-    const job =
-      await response.json();
-
-    bar.style.width =
-      (job.progress || 0) + "%";
-
-    message.textContent =
-      job.message ||
-      job.status;
-
-    if(job.status === "done"){
-
-      download.innerHTML =
-        '<a href="/api/jobs/' +
-        id +
-        '/download">' +
-        '下载完整高清 PNG' +
-        '</a>';
-
-      start.disabled = false;
-
-      return;
-    }
-
-    if(job.status === "error"){
-
-      start.disabled = false;
-
-      return;
-    }
-
-    setTimeout(
-      function(){
-        poll(id);
+    const response = await fetch("/api/start", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
       },
-      1000
-    );
+      body: JSON.stringify({ url })
+    });
 
-  }catch(error){
+    const text = await response.text();
 
-    message.textContent =
-      "读取进度失败：" +
-      error.message;
+    let data;
 
-    start.disabled = false;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        "服务器没有返回 JSON。\n\n" +
+        "服务器实际返回的是：\n" +
+        text.slice(0, 500)
+      );
+    }
 
+    if (!response.ok) {
+      throw new Error(data.error || "创建任务失败");
+    }
+
+    await monitor(data.id);
+
+  } catch (err) {
+
+    statusEl.textContent = "发生错误";
+    resultEl.innerHTML =
+      `<div class="error">${escapeHtml(err.message)}</div>`;
+
+    startBtn.disabled = false;
   }
+});
 
+async function monitor(id) {
+
+  while (true) {
+
+    const response =
+      await fetch("/api/status/" + encodeURIComponent(id));
+
+    const text = await response.text();
+
+    let data;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        "读取任务状态时，服务器返回了 HTML 而不是 JSON。\n\n" +
+        text.slice(0, 500)
+      );
+    }
+
+    if (data.error && data.status === "失败") {
+      throw new Error(data.error);
+    }
+
+    statusEl.textContent =
+      data.status || "处理中……";
+
+    progressEl.style.width =
+      `${data.progress || 0}%`;
+
+    if (data.ready) {
+
+      statusEl.textContent = "完成，可以保存";
+
+      resultEl.innerHTML =
+        `<a class="download"
+           href="/api/download/${encodeURIComponent(id)}">
+           保存完整高清图
+         </a>`;
+
+      startBtn.disabled = false;
+      return;
+    }
+
+    if (data.status === "失败") {
+      throw new Error(data.error || "生成失败");
+    }
+
+    await new Promise(resolve =>
+      setTimeout(resolve, 1000)
+    );
+  }
 }
 
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
 </script>
 
 </body>
