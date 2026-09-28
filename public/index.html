@@ -2,21 +2,18 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport"
-      content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>故宫高清图保存器</title>
-
 <style>
 body {
   margin: 0;
   padding: 24px 16px;
-  font-family: -apple-system,BlinkMacSystemFont,
-               "Segoe UI","PingFang SC",
-               "Microsoft YaHei",sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont,
+               "Segoe UI", "PingFang SC",
+               "Microsoft YaHei", sans-serif;
   background: #f5f5f5;
   color: #222;
 }
-
 .box {
   max-width: 720px;
   margin: auto;
@@ -25,12 +22,7 @@ body {
   border-radius: 16px;
   box-shadow: 0 4px 20px rgba(0,0,0,.08);
 }
-
-h1 {
-  margin-top: 0;
-  font-size: 24px;
-}
-
+h1 { margin-top: 0; font-size: 24px; }
 textarea {
   width: 100%;
   height: 110px;
@@ -41,7 +33,6 @@ textarea {
   font-size: 15px;
   resize: vertical;
 }
-
 button {
   width: 100%;
   margin-top: 12px;
@@ -51,226 +42,146 @@ button {
   background: #111;
   color: white;
   font-size: 16px;
+  cursor: pointer;
 }
-
-button:disabled {
-  opacity: .5;
-}
-
+button:disabled { opacity: .5; cursor: not-allowed; }
 #status {
   margin-top: 18px;
   white-space: pre-wrap;
   line-height: 1.6;
+  font-size: 14px;
 }
-
 .info {
   margin-top: 14px;
   padding: 14px;
   background: #f1f1f1;
   border-radius: 10px;
   display: none;
+  white-space: pre-wrap;
+  font-size: 14px;
+  line-height: 1.7;
 }
-
 .download {
   display: none;
-  margin-top: 12px;
+  background: #1a7f37;
 }
 </style>
 </head>
-
 <body>
 
 <div class="box">
+  <h1>高清全图保存器</h1>
+  <p>粘贴数字文物库的 iView 地址：</p>
 
-<h1>高清全图保存器</h1>
+  <textarea id="url"
+    placeholder="https://digicol.dpm.org.cn/iView?id=..."></textarea>
 
-<p>
-粘贴数字文物库的 iView 地址：
-</p>
-
-<textarea id="url"
-placeholder="https://digicol.dpm.org.cn/iView?id=..."></textarea>
-
-<button id="analyze">
-自动解析最高分辨率
-</button>
-
-<div id="status"></div>
-
-<div id="info" class="info"></div>
-
-<button id="download" class="download">
-下载完整高清图
-</button>
-
+  <button id="analyze">自动解析最高分辨率</button>
+  <div id="status"></div>
+  <div id="info" class="info"></div>
+  <button id="download" class="download">下载完整高清图</button>
 </div>
 
 <script>
-const urlInput =
-  document.getElementById("url");
+const urlInput    = document.getElementById("url");
+const analyzeBtn  = document.getElementById("analyze");
+const downloadBtn = document.getElementById("download");
+const statusEl    = document.getElementById("status");
+const infoEl      = document.getElementById("info");
 
-const analyzeBtn =
-  document.getElementById("analyze");
-
-const downloadBtn =
-  document.getElementById("download");
-
-const status =
-  document.getElementById("status");
-
-const info =
-  document.getElementById("info");
-
-let currentSource = null;
+let currentToken = null;
 
 analyzeBtn.onclick = async () => {
-
   const url = urlInput.value.trim();
-
   if (!url) {
-    status.textContent = "请先粘贴网址。";
+    statusEl.textContent = "请先粘贴网址。";
     return;
   }
 
   analyzeBtn.disabled = true;
   downloadBtn.style.display = "none";
-  info.style.display = "none";
+  infoEl.style.display = "none";
+  currentToken = null;
 
-  status.textContent =
+  statusEl.textContent =
     "正在打开网页并读取高清图查看器……\n" +
     "请稍等，这一步可能需要几十秒。";
 
   try {
+    const response = await fetch("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
 
-    const response = await fetch(
-      "/api/analyze",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-        body: JSON.stringify({ url })
-      }
-    );
+    const data = await response.json();
 
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        data.error || "服务器错误"
-      );
-    }
-
-    if (!data.ok) {
-      status.textContent =
-        data.message ||
-        "没有找到高清图参数。";
-
-      console.log(data.network);
-
+    if (!response.ok || !data.ok) {
+      statusEl.textContent =
+        "解析失败：\n" + (data.error || `HTTP ${response.status}`);
       return;
     }
 
-    currentSource = data.source;
+    currentToken = data.token;
 
-    const s = data.source;
+    statusEl.textContent = "解析成功，可以下载了。";
+    infoEl.style.display = "block";
+    infoEl.textContent =
+      `原图尺寸：${data.width} × ${data.height}\n` +
+      `瓦片尺寸：${data.tileSize}\n` +
+      `瓦片重叠：${data.overlap}\n` +
+      `图片格式：${data.format}\n` +
+      `最高层级：${data.maxLevel}\n` +
+      `瓦片网格：${data.columns} × ${data.rows}\n` +
+      `瓦片总数：${data.tiles}`;
 
-    status.textContent =
-      "解析成功。";
-
-    info.style.display = "block";
-
-    info.textContent =
-      `原图尺寸：${s.width} × ${s.height}\n` +
-      `瓦片尺寸：${s.tileSize}\n` +
-      `格式：${s.format}\n` +
-      `参数位置：${data.path}`;
-
-    downloadBtn.style.display =
-      "block";
-
+    downloadBtn.style.display = "block";
   } catch (err) {
-
-    status.textContent =
-      "处理失败：\n" +
-      err.message;
-
+    statusEl.textContent = "处理失败：\n" + err.message;
   } finally {
-
     analyzeBtn.disabled = false;
-
   }
 };
 
 downloadBtn.onclick = async () => {
-
-  if (!currentSource) return;
+  if (!currentToken) return;
 
   downloadBtn.disabled = true;
-
-  status.textContent =
+  statusEl.textContent =
     "正在下载最高层瓦片并拼接完整大图……\n" +
-    "图片越大，需要的时间越长。";
+    "图片越大，需要的时间越长，请耐心等待。";
 
   try {
-
-    const response = await fetch(
-      "/api/download",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-        body: JSON.stringify({
-          source: currentSource
-        })
-      }
-    );
+    const response = await fetch("/api/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: currentToken })
+    });
 
     if (!response.ok) {
-
-      const data =
-        await response.json();
-
-      throw new Error(
-        data.error || "下载失败"
-      );
+      let msg = `HTTP ${response.status}`;
+      try {
+        const data = await response.json();
+        msg = data.error || msg;
+      } catch {}
+      throw new Error(msg);
     }
 
-    const blob =
-      await response.blob();
-
-    const a =
-      document.createElement("a");
-
-    a.href =
-      URL.createObjectURL(blob);
-
-    a.download =
-      "故宫高清全图.jpg";
-
+    const blob = await response.blob();
+    const a = document.createElement("a");
+    const objUrl = URL.createObjectURL(blob);
+    a.href = objUrl;
+    a.download = "故宫高清全图.jpg";
     document.body.appendChild(a);
-
     a.click();
-
     a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
 
-    status.textContent =
-      "完成。手机应该已经开始保存图片。";
-
+    statusEl.textContent = "完成。已开始保存图片。";
   } catch (err) {
-
-    status.textContent =
-      "下载失败：\n" +
-      err.message;
-
+    statusEl.textContent = "下载失败：\n" + err.message;
   } finally {
-
     downloadBtn.disabled = false;
-
   }
 };
 </script>
