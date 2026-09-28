@@ -90,10 +90,8 @@ async function captureTiles(pageUrl) {
       timeout: 60000
     });
 
-    // 等 viewer 初始化
     await page.waitForTimeout(8000);
 
-    // 滚一遍触发懒加载
     await page.evaluate(async () => {
       window.scrollTo(0, document.body.scrollHeight);
       await new Promise(r => setTimeout(r, 1000));
@@ -192,7 +190,6 @@ async function probeTiles(group, referer) {
   const { root, format, maxCapturedLevel, tiles: captured } = group;
   const rootClean = root.replace(/\/+$/, "");
 
-  // 1. 从最高捕获层级往上探，找真正的 maxLevel
   let maxLevel = maxCapturedLevel;
   for (let i = 0; i < 12; i++) {
     const next = maxLevel + 1;
@@ -209,7 +206,6 @@ async function probeTiles(group, referer) {
     }
   }
 
-  // 2. 用已捕获的瓦片得到网格下界
   let minCols = 1, minRows = 1;
   for (const t of captured) {
     if (t.level === maxLevel) {
@@ -230,7 +226,6 @@ async function probeTiles(group, referer) {
     }
   }
 
-  // 3. 探测完整网格
   let cols = minCols;
   while (cols < 300) {
     if (!(await getMeta(cols, 0))) break;
@@ -243,12 +238,10 @@ async function probeTiles(group, referer) {
     rows++;
   }
 
-  // 4. 拿角落瓦片
   const firstMeta = await getMeta(0, 0);
   const lastMeta = await getMeta(cols - 1, rows - 1);
   if (!firstMeta || !lastMeta) throw fail("无法确定瓦片尺寸");
 
-  // 5. 推断 tileSize
   let tileSize = 256;
   if (cols > 1) {
     if (firstMeta.width === 512) tileSize = 512;
@@ -277,7 +270,7 @@ async function probeTiles(group, referer) {
   };
 }
 
-/* ---------------- 拼接（修复 overlap） ---------------- */
+/* ---------------- 拼接 ---------------- */
 
 async function buildImage(src) {
   const {
@@ -307,16 +300,12 @@ async function buildImage(src) {
       const buf = await fetchBuf(url, referer);
       const meta = await sharp(buf).metadata();
 
-      // Deep Zoom：每块瓦片四周含 overlap 像素
-      // 拼接时，除第一行/第一列以外都要裁掉 overlap
       const cropLeft = x > 0 ? overlap : 0;
       const cropTop = y > 0 ? overlap : 0;
 
-      // 该瓦片在画布上应覆盖的内容尺寸
       const contentW = Math.min(tileSize, width - x * tileSize);
       const contentH = Math.min(tileSize, height - y * tileSize);
 
-      // 从瓦片图上裁出来实际需要的内容
       const cropW = Math.min(contentW, meta.width - cropLeft);
       const cropH = Math.min(contentH, meta.height - cropTop);
 
@@ -359,7 +348,7 @@ async function buildImage(src) {
     .toBuffer();
 }
 
-/* ---------------- 公共：从页面 URL 解析出 source ---------------- */
+/* ---------------- 从页面 URL 解析出 source ---------------- */
 
 async function resolveSource(pageUrl) {
   const urls = await captureTiles(pageUrl);
@@ -373,9 +362,7 @@ async function resolveSource(pageUrl) {
 
   const referer = new URL(pageUrl).origin + "/";
 
-  // 依次尝试每组
   for (const g of groups) {
-    // 先试 DZI
     const dzi = await tryFetchDzi(g.root, referer);
     if (dzi) {
       try {
@@ -385,13 +372,42 @@ async function resolveSource(pageUrl) {
       } catch {}
     }
 
-    // 再试探测
     try {
       return await probeTiles(g, referer);
     } catch {}
   }
 
   throw fail("找到了瓦片请求，但无法推断出可拼接的参数。");
+}
+
+/* ---------------- source 缓存 ---------------- */
+
+const sourceCache = new Map();
+const CACHE_TTL = 30 * 60 * 1000;
+
+function putSource(src) {
+  const token =
+    Math.random().toString(36).slice(2, 10) +
+    Date.now().toString(36);
+
+  sourceCache.set(token, { src, at: Date.now() });
+
+  const now = Date.now();
+  for (const [k, v] of sourceCache) {
+    if (now - v.at > CACHE_TTL) sourceCache.delete(k);
+  }
+
+  return token;
+}
+
+function getSource(token) {
+  const item = sourceCache.get(token);
+  if (!item) return null;
+  if (Date.now() - item.at > CACHE_TTL) {
+    sourceCache.delete(token);
+    return null;
+  }
+  return item.src;
 }
 
 /* ---------------- API ---------------- */
@@ -404,11 +420,14 @@ app.post("/api/analyze", async (req, res) => {
 
   try {
     const src = await resolveSource(pageUrl);
+    const token = putSource(src);
+
     const cols = Math.ceil(src.width / src.tileSize);
     const rows = Math.ceil(src.height / src.tileSize);
 
     res.json({
       ok: true,
+      token,
       width: src.width,
       height: src.height,
       tileSize: src.tileSize,
@@ -422,31 +441,51 @@ app.post("/api/analyze", async (req, res) => {
   } catch (e) {
     res.status(500).json({
       ok: false,
-      error: e.public ? e.message : e.message || String(e)
+      error: e.public ? e.message : (e.message || String(e))
     });
   }
 });
 
 app.post("/api/download", async (req, res) => {
-  const pageUrl = String(req.body?.url || "").trim();
-  if (!/^https?:\/\//i.test(pageUrl)) {
-    return res.status(400).json({ ok: false, error: "网址格式不正确" });
+  let src = null;
+
+  const token = String(req.body?.token || "").trim();
+  if (token) {
+    src = getSource(token);
+    if (!src) {
+      return res.status(400).json({
+        ok: false,
+        error: "解析结果已过期，请重新点击「自动解析最高分辨率」。"
+      });
+    }
+  } else {
+    const pageUrl = String(req.body?.url || "").trim();
+    if (!/^https?:\/\//i.test(pageUrl)) {
+      return res.status(400).json({
+        ok: false,
+        error: "缺少 token 或网址"
+      });
+    }
+    try {
+      src = await resolveSource(pageUrl);
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        error: e.public ? e.message : (e.message || String(e))
+      });
+    }
   }
 
   try {
-    const src = await resolveSource(pageUrl);
     const buf = await buildImage(src);
-
     res.set("Content-Type", "image/jpeg");
-    res.set(
-      "Content-Disposition",
-      'attachment; filename="image.jpg"'
-    );
+    res.set("Content-Disposition", 'attachment; filename="image.jpg"');
+    res.set("Content-Length", String(buf.length));
     res.send(buf);
   } catch (e) {
     res.status(500).json({
       ok: false,
-      error: e.public ? e.message : e.message || String(e)
+      error: e.public ? e.message : (e.message || String(e))
     });
   }
 });
